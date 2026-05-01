@@ -1,0 +1,3 @@
+function-app/__blobstorage__/
+function-app/__queuestorage__/
+function-app/__azurite_db*

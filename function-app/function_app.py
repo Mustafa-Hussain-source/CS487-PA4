@@ -1,3 +1,6 @@
+from http import client
+from tokenize import group
+
 import azure.functions as func
 import azure.durable_functions as df
 import os, json, time, requests
@@ -6,7 +9,7 @@ app = df.DFApp(http_auth_level=func.AuthLevel.FUNCTION)
 
 @app.route(route="orchestrators/my_orchestrator", methods=["POST"])
 @app.durable_client_input(client_name="client")
-async def http_starter(req: func.HttpRequest, client: df.DurableOrchestrationClient):
+async def http_starter(req: func.HttpRequest, client):
     order = req.get_json()
     instance_id = await client.start_new("my_orchestrator", client_input=order)
     return client.create_check_status_response(req, instance_id)
@@ -19,7 +22,16 @@ def my_orchestrator(context: df.DurableOrchestrationContext):
     # 3. If invalid, return {"status": "rejected", "reason": <reason>}
     # 4. If valid, call report_activity with the order
     # 5. Return {"status": "completed", "report_url": <report_url>}
-    pass
+    # pass
+    order = context.get_input()
+    validation = yield context.call_activity("validate_activity", order)
+    if not validation.get("valid"):
+        return {"status": "rejected", "reason": validation.get("reason", "unknown")
+        }
+    
+    report_url = yield context.call_activity("report_activity", order)
+    return {"status": "completed", "report_url": report_url
+    }
 
 @app.activity_trigger(input_name="order")
 def validate_activity(order: dict) -> dict:
@@ -28,7 +40,10 @@ def validate_activity(order: dict) -> dict:
     # 2. Make a POST request to VALIDATE_URL with the order as JSON
     # 3. Raise an exception if the request fails (r.raise_for_status())
     # 4. Return the parsed JSON response
-    pass
+    validate_url = os.environ["VALIDATE_URL"]
+    r = requests.post(validate_url, json=order)
+    r.raise_for_status()
+    return r.json()
 
 @app.activity_trigger(input_name="order")
 def report_activity(order: dict) -> str:
@@ -93,4 +108,59 @@ def report_activity(order: dict) -> str:
     # client.container_groups.begin_delete(rg, name)
 
     # return f"{os.environ['STORAGE_ACCOUNT_URL']}/reports/{order_id}.pdf"
-    pass
+    
+    group = ContainerGroup(
+        location=loc,
+        os_type=OperatingSystemTypes.linux,
+        restart_policy=ContainerGroupRestartPolicy.never,
+        identity=ContainerGroupIdentity(
+            type=ResourceIdentityType.user_assigned,
+            user_assigned_identities={mi_id: {}}
+        ),
+        image_registry_credentials=[
+            ImageRegistryCredential(
+                server=os.environ["ACR_SERVER"],
+                username=os.environ["ACR_USERNAME"],
+                password=os.environ["ACR_PASSWORD"]
+            )
+        ],
+        containers=[
+            Container(
+                name="report",
+                image=image,
+                resources=ResourceRequirements(
+                    requests=ResourceRequests(cpu=1.0, memory_in_gb=1.5)
+                ),
+                environment_variables=[
+                    EnvironmentVariable(name="ORDER_ID", value=order_id),
+                    EnvironmentVariable(name="ORDER_JSON", value=json.dumps(order)),
+                    EnvironmentVariable(
+                        name="STORAGE_ACCOUNT_URL",
+                        value=os.environ["STORAGE_ACCOUNT_URL"]
+                    ),
+                    EnvironmentVariable(
+                        name="AZURE_CLIENT_ID",
+                        value=os.environ["AZURE_CLIENT_ID"]
+                    ),
+                ]
+            )
+        ]
+    )
+
+    client.container_groups.begin_create_or_update(rg, name, group).result()
+
+    for _ in range(60):
+        info = client.container_groups.get(rg, name)
+        state = info.instance_view.state if info.instance_view else None
+
+        if state in ("Succeeded", "Failed"):
+            break
+
+        time.sleep(5)
+
+    if state != "Succeeded":
+        raise Exception(f"Report job failed with state: {state}")
+
+    client.container_groups.begin_delete(rg, name).result()
+
+    return f"{os.environ['STORAGE_ACCOUNT_URL']}/reports/{order_id}.pdf"
